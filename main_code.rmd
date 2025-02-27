@@ -1,0 +1,369 @@
+---
+title: "Machine Learning for Macroeconomics - Project"
+author: "Éloïse Leroux,  Matthieu Grenier, Matteo van Ypersele"
+date: "31/01/2025"
+output: html_document
+---
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+### Required Packages
+
+Run the following code to install the necessary packages if they are not already installed.
+
+```{r, results = 'hide', eval = FALSE}
+install.packages("stats")
+install.packages("readr")
+install.packages("pracma")
+install.packages("devtools")
+install.packages("glmnet")
+library(devtools)
+devtools::install_github("cykbennie/fbi")
+install.packages("BVAR")
+```
+
+
+### Introduction
+
+This script compares three forecasting methods seen in class to predict inflation in France:
+
+1. **LASSO** (Least Absolute Shrinkage and Selection Operator)
+2. **Random Forest** (Machine Learning)
+3. **PCA + OLS** (Principal Component Analysis followed by a linear regression)
+
+The dataset used for the forecast comes from the EA-MD-QD collection. The raw data has already been processed by a Matlab code, available in the Github. The sheet we used here is `FRdataM_LT.xlsx`. Its variables are monthly observations of various french indicators.
+
+
+The forecast we aim to propose covers a **12-month horizon**.
+
+
+###Data processing
+```{r, message = FALSE}
+#Imports
+library(BVAR)
+library(glmnet)
+library(readxl)
+library(purrr)
+library(dplyr)
+library(randomForest)
+library(ggplot2)
+```
+
+```{r}
+current_directory <- dirname(rstudioapi::getSourceEditorContext()$path)
+setwd(current_directory)
+```
+
+### 📌 Data loading and processing
+```{r}
+file_path <- 'data/FRdataM_LT.xlsx'
+data <- read_excel(file_path)  
+
+data$Time <- as.Date(data$Time)#Proper date format
+
+y_inflationglobale <- ts(data$HICPOV_FR, start = c(2000, 1), frequency = 12)
+
+excluded_cols <- c("Time", "HICPOV_FR", "HICPNEF_FR", "HICPG_FR", "HICPIN_FR",
+                   "HICPNG_FR", "PPICAG_FR", "PPICOG_FR", "PPINDCOG_FR", 
+                   "PPIDCOG_FR", "PPIING_FR", "PPINRG_FR")
+X <- as.matrix(data[, !(names(data) %in% excluded_cols)])
+
+data <- data[-nrow(data), ]#The last row has too much missing values
+
+start_date <- "2000-02-01"
+start_sample <- which(data$Time == start_date)
+```
+
+At this point, the data is ready for forecasting. The following graph represents the outcome variable, distinguishing the test and the training set.
+
+```{r}
+start_sample <- 226  
+
+train_end <- data$Time[start_sample]
+data$Set <- ifelse(data$Time <= train_end, "Training", "Test")
+
+ggplot(data, aes(x = Time, y = HICPOV_FR, color = Set)) +
+  geom_line() +
+  geom_vline(xintercept = as.numeric(train_end), linetype = "dashed", color = "black") +
+  scale_color_manual(values = c("Training" = "blue", "Test" = "orange")) +
+  labs(x = "Time", y = "Corrected Inflation Rate", color = "Set") +
+  theme_minimal()
+```
+
+### 📌 Tuning parameters
+
+Two tuning parameters are considered :
+- 'HH' is the forecast horizon in months
+- 'DEMEAN' allows to control standardisation and normalisation
+
+```{r}
+DEMEAN <- 2   # 2 : Standardisation
+HH <- 12      # Forecast horizon
+ 
+```
+
+The use of the `DEMEAN` parameter might be clearer with the following function :
+
+```{r}
+transform_data <- function(x, DEMEAN) {
+  x[is.na(x)] <- colMeans(x, na.rm = TRUE)[col(x)[is.na(x)]]  # Replaces NAs
+  x <- x[, colSums(!is.na(x)) > 0]  # Deletes empty columns
+  
+  if (DEMEAN == 1) {
+    return(scale(x, center = TRUE, scale = FALSE))
+  } else if (DEMEAN == 2) {
+    return(scale(x, center = FALSE, scale = TRUE))
+  } else if (DEMEAN == 3) {
+    return(scale(x, center = TRUE, scale = TRUE))
+  }
+  return(x)
+}
+```
+
+
+
+## 📌 Models
+The following functions are used to fit all of our models.
+
+### 1️⃣ PCA + OLS
+```{r, warning = FALSE, message=FALSE}
+PCA_OLS_regression <- function(y, X, kmax = 8) {
+  X_scaled <- transform_data(X, DEMEAN)
+  
+  # PCA using SVD
+  svd_result <- svd(X_scaled)
+  Fhat <- svd_result$u[, 1:kmax]  # k first factors are considered
+  
+  # OLS regression on the principal components
+  Fhat_k <- cbind(1, Fhat)
+  ols_model <- lm(y ~ ., data = as.data.frame(Fhat_k))
+  
+  # Prédiction
+  pred <- predict(ols_model, newdata = as.data.frame(tail(Fhat_k, 1)))
+  
+  return(list(pred = pred, model = ols_model))
+}
+```
+
+---
+
+### 2️⃣ LASSO
+```{r}
+Lasso_regression <- function(yy, x, DEMEAN) {
+  # Smoothing of the outcome value
+  Y <- stats::filter(yy, filter = rep(1/HH, HH), sides = 1)
+  
+  # NA values check
+  if (any(rowSums(is.na(x)) == ncol(x))) {
+    stop("x has an empty row")
+  }
+  
+  # Empty columns are replaced/deleted
+  Index_missing <- which(colSums(is.na(x)) == nrow(x))
+  Index_zeros <- which(colSums(x == 0) == nrow(x))
+  Index_remove <- unique(c(Index_missing, Index_zeros))
+  
+  if (length(Index_remove) > 0) {
+    x <- subset(x, select = -Index_remove)
+  }
+  
+  # Check on the DEMEAN parameter
+  if (!(DEMEAN %in% 0:3)) {
+    stop("DEMEAN is incorrectly specified")
+  }
+  
+  # Missing values are replaced with the mean value of each column
+  mut <- matrix(rep(colMeans(x, na.rm = TRUE), nrow(x)), nrow = nrow(x), ncol = ncol(x), byrow = TRUE)
+  x[is.na(x)] <- mut[is.na(x)]
+  
+  # Standardisation
+  x <- transform_data(x, DEMEAN)
+  
+  # Further cheks of null columns
+  Index_zeros <- which(colSums(x == 0) == nrow(x))
+  if (length(Index_zeros) > 0) {
+    x <- subset(x, select = -Index_zeros)
+  }
+  
+  # Regression matrices and standardisation of the outcome variable
+  Z <- as.matrix(x[1:(nrow(x) - HH), ])
+  Y <- as.matrix(Y[(HH + 1):length(Y)])
+
+  my <- colMeans(Y, na.rm = TRUE)
+  sy <- sd(Y, na.rm = TRUE) / sqrt(length(Y))
+  Y_std <- (Y - my) / sy
+  
+  # Lasso regression
+  cv.m <- cv.glmnet(Z, Y_std, alpha = 1)
+  
+  # Forecast
+  pred <- predict(cv.m, newx = tail(Z, 1))
+  prediction <- pred * sy + my
+  
+  return(list(pred = prediction, model = cv.m))
+}
+```
+
+---
+
+### 3️⃣ Random Forest
+```{r}
+Random_Forest_regression <- function(yy, x, DEMEAN) {
+  #USUAL CHECKS
+  # NA values check
+  if (any(rowSums(is.na(x)) == ncol(x))) {
+    stop("x has an empty row")
+  }
+  
+  # Empty columns are replaced/deleted
+  Index_missing <- which(colSums(is.na(x)) == nrow(x))
+  Index_zeros <- which(colSums(x == 0) == nrow(x))
+  Index_remove <- unique(c(Index_missing, Index_zeros))
+  
+  if (length(Index_remove) > 0) {
+    x <- subset(x, select = -Index_remove)
+  }
+  
+  # Check on the DEMEAN parameter
+  if (!(DEMEAN %in% 0:3)) {
+    stop("DEMEAN is incorrectly specified")
+  }
+  
+  # Missing values are replaced with the mean value of each column
+  mut <- matrix(rep(colMeans(x, na.rm = TRUE), nrow(x)), nrow = nrow(x), ncol = ncol(x), byrow = TRUE)
+  x[is.na(x)] <- mut[is.na(x)]
+  
+  # Standardisation
+  x <- transform_data(x, DEMEAN)
+  
+  # Further cheks of null columns
+  Index_zeros <- which(colSums(x == 0) == nrow(x))
+  if (length(Index_zeros) > 0) {
+    x <- subset(x, select = -Index_zeros)
+  }
+  
+  # Regression matrices and standardisation of the outcome variable
+  Z <- as.matrix(x[1:(nrow(x) - HH), ])
+  Y <- as.matrix(yy[(HH + 1):length(yy)])
+
+  my <- colMeans(Y, na.rm = TRUE)
+  sy <- sd(Y, na.rm = TRUE) / sqrt(length(Y))
+  Y_std <- (Y - my) / sy
+  
+  
+  rf.fit <- randomForest(Z,Y_std,ntree=500,mtry=20,importance=TRUE)
+  
+  # Forecast
+  pred <- predict(rf.fit, newx = tail(Z, 1))
+  prediction <- pred * sy + my
+  
+  return(list(pred = prediction, model = rf.fit))
+}
+```
+
+---
+
+## 📌 Forecast
+
+The forecast methods are implemented using rollin window forecasting, that is to say that each forecast uses models fit on a given window of previous observations.
+
+```{r, warning=FALSE, message=FALSE, results='hide', fig.keep='none'}
+
+# Matrices to store the results
+TT <- nrow(data)
+start_sample <- 226
+true <- rep(NA, TT - start_sample)
+Lasso <- rep(NA, TT - start_sample)
+RandomForest <- rep(NA, TT - start_sample)
+PCA_OLS <- rep(NA, TT - start_sample)
+
+for (j in start_sample:(TT - HH)) {
+  j0 <- max(1, j - start_sample + 1)
+  
+  x_temp <- X[j0:j, ]
+  y_temp <- y_inflationglobale[j0:j]
+  
+  # Lasso
+  result_Lasso <- Lasso_regression(y_temp, x_temp, DEMEAN)
+  Lasso[j - start_sample + 1] <- result_Lasso$pred
+  
+  # RF
+  result_RF <- Random_Forest_regression(y_temp, x_temp, DEMEAN)
+  RandomForest[j - start_sample + 1] <- result_RF$pred
+  
+  #PCA+OLS
+  result_PCA_OLS <- PCA_OLS_regression(y_temp, x_temp)
+  PCA_OLS[j - start_sample + 1] <- result_PCA_OLS$pred
+  
+  # True value
+  true[j - start_sample + 1] <- y_inflationglobale[j + HH]
+}
+
+#NAs error handling
+Index_valid <- which(!is.na(true) & !is.na(PCA_OLS) & !is.na(Lasso) & !is.na(RandomForest))
+true_NA <- true[Index_valid]
+PCA_OLS_NA <- PCA_OLS[Index_valid]
+Lasso_NA <- Lasso[Index_valid]
+RandomForest_NA <- RandomForest[Index_valid]
+dates_OOS <- data$Time[(start_sample + 1):(TT - HH)][Index_valid]
+
+```
+
+Descriptive statistics can be drawn from our model selection in the dynamic forecasting loop.
+
+---
+
+## 📌 Performance comparison
+The performance of models can be compared through the Mean Absolute Error (MAE) and the Mean Squared Error (MSE).
+```{r}
+MSFE_PCA_OLS <- sqrt(mean((true_NA - PCA_OLS_NA)^2))
+MSFE_Lasso <- sqrt(mean((true_NA - Lasso_NA)^2))
+MSFE_RF <- sqrt(mean((true_NA - RandomForest_NA)^2))
+
+MAE_PCA_OLS <- mean(abs(true_NA - PCA_OLS_NA))
+MAE_Lasso <- mean(abs(true_NA - Lasso_NA))
+MAE_RF <- mean(abs(true_NA - RandomForest_NA))
+
+tab <- data.frame(
+  Méthode = c("PCA + OLS", "Lasso", "Random Forest"),
+  MSFE = c(MSFE_PCA_OLS, MSFE_Lasso, MSFE_RF),
+  MAE = c(MAE_PCA_OLS, MAE_Lasso, MAE_RF)
+)
+print(tab)
+```
+
+For instance, the last fitted random forest yields the following results :
+```{r}
+result_RF$model
+```
+Similar tabs can be obtained for the Lasso model, as well as for the optimal choice of $\lambda$.
+```{r}
+result_Lasso$model
+plot(result_Lasso$model)
+```
+---
+
+One can also inspect the results of the OLS on the principal components to better grasp the mechanisms used for this method to forecast.
+```{r}
+library(jtools)
+summ(result_PCA_OLS$model)
+```
+
+
+
+
+
+
+## 📌 Forecast
+
+Now that all of our models are fitted, one can see how inflation is predicted by each method. 
+```{r}
+plot(dates_OOS, true_NA, type = "l", col = "black", main = "Comparaison des Prédictions", xlab = "Date", ylab = "Inflation")
+lines(dates_OOS, PCA_OLS_NA, col = "green", lwd = 2)
+lines(dates_OOS, Lasso_NA, col = "red", lwd = 2)
+lines(dates_OOS, RandomForest_NA, col = "blue", lwd = 2)
+legend("topright", legend = c("Réel", "PCA + OLS", "Lasso", "Random Forest"), col = c("black", "green", "red", "blue"), lty = 1, lwd = 2)
+
+```
+
